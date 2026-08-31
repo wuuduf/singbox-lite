@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="20"
+export SCRIPT_VERSION="21"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/wuuduf/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
@@ -726,8 +726,127 @@ _ensure_nftables() {
     return 0
 }
 
+_get_singbox_series_release() {
+    local series="$1"
+    local page=1
+    local page_info=""
+    local release_info=""
+
+    # GitHub 的 releases 列表按时间倒序；分页查找，避免旧分支掉出第一页。
+    while [ "$page" -le 5 ]; do
+        if ! page_info=$(curl -fsSL --retry 2 --connect-timeout 10 \
+            "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=100&page=${page}"); then
+            return 1
+        fi
+
+        release_info=$(printf '%s' "$page_info" | jq -c --arg series "$series" '
+            [.[]
+                | select(.draft == false and .prerelease == false)
+                | select(.tag_name | startswith("v" + $series + ".") or startswith($series + "."))
+            ][0] // empty
+        ')
+        if [ -n "$release_info" ]; then
+            printf '%s' "$release_info"
+            return 0
+        fi
+
+        [ "$(printf '%s' "$page_info" | jq 'length')" -lt 100 ] && break
+        page=$((page + 1))
+    done
+
+    return 1
+}
+
+_select_singbox_release() {
+    local choice=""
+    local requested_tag=""
+    local encoded_tag=""
+    local api_url=""
+    local release_info=""
+    local release_desc=""
+
+    echo ""
+    echo -e "  ${CYAN}请选择 Sing-box 内核版本：${NC}"
+    echo -e "    ${GREEN}[1]${NC} 最新稳定版"
+    echo -e "    ${GREEN}[2]${NC} 最新预览版（beta/rc）"
+    echo -e "    ${GREEN}[3]${NC} v1.12.x 最新稳定版"
+    echo -e "    ${GREEN}[4]${NC} v1.11.x 最新稳定版"
+    echo -e "    ${GREEN}[5]${NC} 手动输入版本"
+    echo -e "    ${YELLOW}[6]${NC} 保留当前内核并返回"
+    echo ""
+
+    if ! read -r -p "  请输入选项 [1-6，默认 1]: " choice; then
+        choice="1"
+        _warn "未检测到交互输入，将使用最新稳定版。"
+    fi
+    choice="${choice:-1}"
+
+    case "$choice" in
+        1)
+            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+            release_desc="最新稳定版"
+            ;;
+        2)
+            api_url="https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30&page=1"
+            release_desc="最新预览版"
+            ;;
+        3|4)
+            local series="1.12"
+            [ "$choice" = "4" ] && series="1.11"
+            _info "正在查询 v${series}.x 最新稳定版..."
+            if ! release_info=$(_get_singbox_series_release "$series"); then
+                _error "无法找到 v${series}.x 的稳定版发布。"
+                return 1
+            fi
+            release_desc="v${series}.x 最新稳定版"
+            ;;
+        5)
+            read -r -p "  请输入版本（例如 v1.12.10）: " requested_tag
+            requested_tag="${requested_tag#v}"
+            if [[ ! "$requested_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([._+-][0-9A-Za-z.-]+)?$ ]]; then
+                _error "版本格式无效，请输入类似 v1.12.10 或 v1.13.0-beta.1 的版本号。"
+                return 1
+            fi
+            requested_tag="v${requested_tag}"
+            encoded_tag=$(_url_encode "$requested_tag")
+            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/${encoded_tag}"
+            release_desc="手动指定版本"
+            ;;
+        6)
+            _info "已取消安装/更新，保留当前 Sing-box 内核。"
+            return 2
+            ;;
+        *)
+            _error "无效选项：${choice}"
+            return 1
+            ;;
+    esac
+
+    if [ -z "$release_info" ]; then
+        _info "正在查询 ${release_desc}..."
+        if ! release_info=$(curl -fsSL --retry 2 --connect-timeout 10 "$api_url"); then
+            _error "无法获取 ${release_desc} 的发布信息。"
+            return 1
+        fi
+        if [ "$choice" = "2" ]; then
+            release_info=$(printf '%s' "$release_info" | jq -c \
+                '[.[] | select(.draft == false and .prerelease == true)][0] // empty')
+        fi
+    fi
+
+    if [ -z "$release_info" ] || ! printf '%s' "$release_info" | jq -e \
+        '.tag_name and (.assets | type == "array")' >/dev/null 2>&1; then
+        _error "GitHub 返回的发布信息无效，未找到 ${release_desc}。"
+        return 1
+    fi
+
+    SINGBOX_SELECTED_RELEASE="$release_info"
+    SINGBOX_SELECTED_TAG=$(printf '%s' "$release_info" | jq -r '.tag_name')
+    _info "已选择 Sing-box ${SINGBOX_SELECTED_TAG}（${release_desc}）。"
+    return 0
+}
+
 _install_sing_box() {
-    _info "正在安装最新稳定版 sing-box..."
     local arch=$(uname -m)
     local arch_tag
     local temp_dir=""
@@ -747,17 +866,20 @@ _install_sing_box() {
         libc_suffix="-musl"
     fi
     
-    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local release_info=$(curl -s "$api_url")
-    local download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
+    local download_url
+    download_url=$(printf '%s' "$SINGBOX_SELECTED_RELEASE" | jq -r --arg pattern "$search_pattern" \
+        '.assets[] | select(.name | endswith($pattern)) | .browser_download_url' | head -1)
 
-    if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; return 1; fi
+    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+        _error "${SINGBOX_SELECTED_TAG} 没有适用于当前环境的安装包 (搜索: ${search_pattern})。"
+        return 1
+    fi
 
     temp_dir=$(mktemp -d /root/.singbox-install.XXXXXX) || { _error "创建临时目录失败。"; return 1; }
     archive_path="${temp_dir}/sing-box.tar.gz"
 
-    _info "正在下载 sing-box 安装包..."
+    _info "正在下载 sing-box ${SINGBOX_SELECTED_TAG} 安装包..."
     if ! wget -qO "$archive_path" "$download_url"; then
         _error "下载失败: $download_url"
         rm -rf "$temp_dir"
@@ -796,7 +918,7 @@ _install_sing_box() {
 
     rm -rf "$temp_dir"
     _release_install_cache
-    _success "sing-box 安装成功: ${SINGBOX_BIN}"
+    _success "sing-box ${SINGBOX_SELECTED_TAG} 安装成功: ${SINGBOX_BIN}"
 }
 
 _install_cloudflared() {
@@ -5024,10 +5146,20 @@ _install_or_update_singbox() {
 # 执行 sing-box 核心的安装/更新
 _do_update_singbox() {
     _info "--- 安装/更新 Sing-box 核心 ---"
+    local select_status=0
+    _select_singbox_release || select_status=$?
+    if [ "$select_status" -eq 2 ]; then
+        return 0
+    elif [ "$select_status" -ne 0 ]; then
+        _error "Sing-box 版本选择失败。"
+        return "$select_status"
+    fi
+
     _install_dependencies true
-    _install_sing_box
-    
-    if [ $? -eq 0 ]; then
+    local install_status=0
+    _install_sing_box || install_status=$?
+
+    if [ "$install_status" -eq 0 ]; then
         _success "sing-box 安装/更新成功！"
         # 确保配置文件存在
         if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
@@ -5045,6 +5177,7 @@ _do_update_singbox() {
         _success "[主] 服务已就绪。"
     else
         _error "Sing-box 核心安装/更新失败。"
+        return "$install_status"
     fi
 }
 

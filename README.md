@@ -86,7 +86,7 @@
 进入交互菜单手动配置节点：
 
 ```
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+(curl -LfsS https://raw.githubusercontent.com/wuuduf/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/wuuduf/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 **快捷命令：sb**
@@ -116,11 +116,25 @@
 | | [11] | 同步系统时间 |
 | **配置与更新** | [12] | 检查配置文件 |
 | | [13] | 更新脚本 |
-| | [14] | 安装/更新 Sing-box 核心 |
-| | [15] | 安装/更新 Xray 核心 |
-| | [16] | 卸载脚本 |
-| **进阶功能** | [17] | 落地/中转/第三方节点导入 |
-| | [18] | Xray 核心管理 |
+| | [14] | DNS 设置 |
+| **核心管理** | [15] | 安装/更新 Sing-box 核心（可选版本） |
+| | [16] | 安装/更新 Xray 核心 |
+| | [17] | 卸载脚本 |
+| **进阶功能** | [18] | 落地/中转/第三方节点导入 |
+| | [19] | Xray 节点管理 |
+
+#### 选择 Sing-box 内核版本
+
+进入主菜单 **[15] 安装/更新 Sing-box 核心** 后，可以主动选择：
+
+1. 最新稳定版
+2. 最新预览版（beta/rc）
+3. v1.12.x 最新稳定版
+4. v1.11.x 最新稳定版
+5. 手动输入具体版本（例如 `v1.12.10`）
+6. 保留当前内核并返回
+
+选择旧版本可用于配置兼容或故障回退；脚本会从 sing-box 官方 GitHub Release 中解析与当前 CPU 架构及 libc 匹配的安装包。
 
 #### 导入第三方节点
 
