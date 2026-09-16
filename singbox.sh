@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="21"
+export SCRIPT_VERSION="22"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -2637,11 +2637,16 @@ _show_node_link() {
             url="trojan://$(_url_encode "${password}")@${link_ip}:443?security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ed_path")&sni=${link_ip}#$(_url_encode "$name")"
             ;;
         "socks")
-            # 参数: username, password
-            local username="$1" password="$2"
+            # 参数: username, password, auth_enabled
+            local username="$1" password="$2" auth_enabled="${3:-true}"
             echo ""
-            _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 用户名: ${username}, 密码: ${password}"
-            return
+            if [ "$auth_enabled" = "true" ]; then
+                _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 用户名: ${username}, 密码: ${password}"
+                url="socks5://$(_url_encode "$username"):$(_url_encode "$password")@${link_ip}:${port}#$(_url_encode "$name")"
+            else
+                _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 认证: 无（无需用户名和密码）"
+                url="socks5://${link_ip}:${port}#$(_url_encode "$name")"
+            fi
             ;;
     esac
     
@@ -4121,6 +4126,7 @@ _add_socks() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
+    local auth_enabled="true"
     local username=""
     local password=""
 
@@ -4130,8 +4136,12 @@ _add_socks() {
             _error "批量创建错误: BATCH_PORT 为空，跳过 SOCKS5 安装。"
             return 1
         fi
-        username=$(${SINGBOX_BIN} generate rand --hex 8)
-        password=$(${SINGBOX_BIN} generate rand --hex 16)
+        auth_enabled="${BATCH_SOCKS_AUTH:-true}"
+        [ "$auth_enabled" = "false" ] || auth_enabled="true"
+        if [ "$auth_enabled" = "true" ]; then
+            username=$(${SINGBOX_BIN} generate rand --hex 8)
+            password=$(${SINGBOX_BIN} generate rand --hex 16)
+        fi
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
@@ -4141,23 +4151,34 @@ _add_socks() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        read -p "请输入用户名 (默认随机): " username; username=${username:-$(${SINGBOX_BIN} generate rand --hex 8)}
-        read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
+        echo "请选择 SOCKS5 认证方式:"
+        echo "  1) 用户名 + 密码（默认）"
+        echo "  2) 无认证（无需用户名和密码）"
+        read -p "请选择 [1/2] (默认: 1): " auth_choice
+        case "${auth_choice:-1}" in
+            2) auth_enabled="false" ;;
+            1) auth_enabled="true" ;;
+            *) _error "无效选择，请输入 1 或 2。"; return 1 ;;
+        esac
+        if [ "$auth_enabled" = "true" ]; then
+            read -p "请输入用户名 (默认随机): " username; username=${username:-$(${SINGBOX_BIN} generate rand --hex 8)}
+            read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
+        fi
     fi
     local tag="socks-in-${port}"
     local name="Batch-SOCKS5-${port}"
     [ "$BATCH_MODE" != "true" ] && name="SOCKS5-${port}"
     local display_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && display_ip="[$node_ip]"
 
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$username" --arg pw "$password" \
-        '{"type":"socks","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"username":$u,"password":$pw}]}')
+    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$username" --arg pw "$password" --arg auth "$auth_enabled" \
+        '{"type":"socks","tag":$t,"listen":"::","listen_port":($p|tonumber)} | if $auth == "true" then .users=[{"username":$u,"password":$pw}] else . end')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
 
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg u "$username" --arg pw "$password" \
-        '{"name":$n,"type":"socks5","server":$s,"port":($p|tonumber),"username":$u,"password":$pw}')
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg u "$username" --arg pw "$password" --arg auth "$auth_enabled" \
+        '{"name":$n,"type":"socks5","server":$s,"port":($p|tonumber)} | if $auth == "true" then .username=$u | .password=$pw else . end')
     _add_node_to_yaml "$proxy_json"
     _success "SOCKS5 节点添加成功!"
-    _show_node_link "socks" "$name" "$display_ip" "$port" "$tag" "$username" "$password"
+    _show_node_link "socks" "$name" "$display_ip" "$port" "$tag" "$username" "$password" "$auth_enabled"
 }
 
 _view_nodes() {
@@ -4329,10 +4350,14 @@ _view_nodes() {
                 url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$display_name")"
                 ;;
             "socks")
-                # [资源优化] 合并2次jq为1次
-                local u p
-                IFS=$'\t' read -r u p <<< "$(echo "$node" | jq -r '[.users[0].username, .users[0].password] | @tsv')"
-                _info "  类型: SOCKS5, 地址: $display_server, 端口: $port, 用户: $u, 密码: $p"
+                if [ "$(echo "$node" | jq -r '((.users // []) | length > 0)')" = "true" ]; then
+                    # [资源优化] 合并2次jq为1次
+                    local u p
+                    IFS=$'\t' read -r u p <<< "$(echo "$node" | jq -r '[.users[0].username, .users[0].password] | @tsv')"
+                    _info "  类型: SOCKS5, 地址: $display_server, 端口: $port, 用户: $u, 密码: $p"
+                else
+                    _info "  类型: SOCKS5, 地址: $display_server, 端口: $port, 认证: 无（无需用户名和密码）"
+                fi
                 ;;
         esac
         fi
@@ -5835,6 +5860,7 @@ _batch_create_nodes() {
     local has_complex=false 
     local has_sni_req=false 
     local has_hy2=false     
+    local has_socks=false
     local has_ss=false      
     local ss_occurences=0
 
@@ -5855,6 +5881,7 @@ _batch_create_nodes() {
         [[ "$pid" =~ ^(6|8)$ ]] && has_complex=true
         [[ "$pid" =~ ^(1|4|5|6|7)$ ]] && has_sni_req=true
         [[ "$pid" == "6" ]] && has_hy2=true
+        [[ "$pid" == "10" ]] && has_socks=true
     done
 
     [ $proto_count -eq 0 ] && { _error "未选择任何协议"; return 1; }
@@ -5905,6 +5932,20 @@ _batch_create_nodes() {
         local ss_needed=$(echo "$ss_variant" | tr ',' ' ' | wc -w)
         # 每个 Shadowsocks ID (7) 额外需要 (ss_needed - 1) 个端口
         proto_count=$((proto_count + (ss_needed - 1) * ss_occurences))
+    fi
+
+    # 2.5 SOCKS5 专项
+    local socks_auth="true"
+    if [ "$has_socks" = true ]; then
+        echo "选择 SOCKS5 认证方式:"
+        echo " 1) 用户名 + 密码（默认）"
+        echo " 2) 无认证（无需用户名和密码）"
+        read -p "选择 [1/2] (默认1): " socks_choice
+        case "${socks_choice:-1}" in
+            2) socks_auth="false" ;;
+            1) socks_auth="true" ;;
+            *) _error "无效选择，请输入 1 或 2。"; return 1 ;;
+        esac
     fi
 
     # 3. 端口规划
@@ -5987,6 +6028,7 @@ _batch_create_nodes() {
             export BATCH_PORT="$current_port"
             export BATCH_HY2_OBFS="$hy2_obfs"
             export BATCH_HY2_HOP="$hy2_hop_range"
+            export BATCH_SOCKS_AUTH="$socks_auth"
 
             case $pid in
                 1) _add_vless_reality ;;
@@ -6003,7 +6045,7 @@ _batch_create_nodes() {
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SOCKS_AUTH BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
